@@ -1,0 +1,11 @@
+// ============================================
+// CVM++ Example: String Operations
+// ============================================
+
+print "Hello, CVM++!"
+print "Welcome to the Stack-Based VM"
+
+let greeting = "The answer is: "
+let answer = 42
+print greeting
+print answer

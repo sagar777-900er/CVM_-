@@ -1,0 +1,18 @@
+// ============================================
+// CVM++ Example: Variables & Arithmetic
+// ============================================
+// Demonstrates variable declarations, arithmetic,
+// and expression evaluation
+
+let width = 10
+let height = 5
+let area = width * height
+print area
+
+// Compute average of three numbers
+let a = 30
+let b = 60
+let c = 90
+let sum = a + b + c
+let avg = sum / 3
+print avg

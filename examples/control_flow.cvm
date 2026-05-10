@@ -1,0 +1,20 @@
+// ============================================
+// CVM++ Example: Control Flow
+// ============================================
+// Demonstrates if/else and while loops
+
+let x = 10
+
+if x > 5 {
+    print 1
+} else {
+    print 0
+}
+
+// Count down from 5
+let i = 5
+while i > 0 {
+    print i
+    i = i - 1
+}
+print 0
