@@ -1,0 +1,14 @@
+// ============================================
+// CVM++ Example: Functions
+// ============================================
+
+fn add(a, b) {
+    return a + b
+}
+
+fn greet(name) {
+    print "Hello, " + name + "!"
+}
+
+greet("Alice")
+print "10 + 20 = " + add(10, 20)

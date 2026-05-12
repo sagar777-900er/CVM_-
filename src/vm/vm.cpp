@@ -1,34 +1,5 @@
 // ============================================================================
-// CVM++ : vm.cpp — Virtual Machine Implementation
-// ============================================================================
-//
-// This file implements the stack-based virtual machine.
-//
-// THE DISPATCH LOOP
-// -----------------
-// The heart of the VM is a single for(;;) loop with a switch statement.
-// Each case handles one opcode.  This pattern is called a
-// "switch-threaded" interpreter — the simplest and most common design.
-//
-// STACK VISUALIZATION
-// -------------------
-// For "let x = 5 + 2":
-//
-//   Instruction          Stack (top →)
-//   ────────────         ──────────────
-//   OP_CONSTANT 5        [5]
-//   OP_CONSTANT 2        [5, 2]
-//   OP_ADD                [7]
-//   OP_SET_GLOBAL 0      []          ← stored 7 in globals[0]
-//
-// For "print x + 3":
-//
-//   Instruction          Stack (top →)
-//   ────────────         ──────────────
-//   OP_GET_GLOBAL 0      [7]         ← loaded from globals[0]
-//   OP_CONSTANT 3        [7, 3]
-//   OP_ADD                [10]
-//   OP_PRINT              []          ← printed "10"
+// CVM++ : vm/vm.cpp — Virtual Machine Implementation
 // ============================================================================
 
 #include "vm.h"
@@ -41,91 +12,135 @@ namespace cvm {
 // ============================================================================
 
 VM::VM()
-    : chunk_(nullptr), ip_(0), sp_(0), hadError_(false) {
-    // Pre-allocate globals (256 slots max)
+    : sp_(0), frameCount_(0), hadError_(false), traceExecution_(false) {
     globals_.resize(256);
 }
 
 // ============================================================================
-// interpret — run a compiled chunk
+// interpret — run a compiled chunk (top-level script)
 // ============================================================================
 
 VMResult VM::interpret(const Chunk& chunk) {
-    chunk_ = &chunk;
-    ip_ = 0;
+    // We treat the top-level chunk as a function with no parameters
+    auto script = std::make_shared<FunctionObj>();
+    script->name = "<script>";
+    script->arity = 0;
+    script->chunk = chunk;
+
+    // Reset VM state
     sp_ = 0;
+    frameCount_ = 0;
     hadError_ = false;
+
+    // Call the script function
+    push(Value(script)); // function value sits at basePointer
+    callFunction(script, 0);
 
     return run();
 }
 
 // ============================================================================
-// run — the main dispatch loop (fetch-decode-execute)
+// callFunction — set up a new CallFrame
+// ============================================================================
+
+bool VM::callFunction(std::shared_ptr<FunctionObj> func, int argCount) {
+    if (argCount != func->arity) {
+        runtimeError("Expected " + std::to_string(func->arity) +
+                     " arguments but got " + std::to_string(argCount) + ".");
+        return false;
+    }
+
+    if (frameCount_ == FRAMES_MAX) {
+        runtimeError("Stack overflow (max frames exceeded).");
+        return false;
+    }
+
+    CallFrame& frame = frames_[frameCount_++];
+    frame.chunk = &func->chunk;
+    frame.ip = 0;
+    // The base of this frame is where the function object was pushed,
+    // which is argCount slots down from the top of the stack.
+    frame.basePointer = sp_ - argCount - 1;
+
+    return true;
+}
+
+// ============================================================================
+// Trace Helper
+// ============================================================================
+
+void VM::printStack() const {
+    std::cout << "          ";
+    for (int i = 0; i < sp_; i++) {
+        std::cout << "[ " << valueToString(stack_[i]) << " ]";
+    }
+    std::cout << std::endl;
+}
+
+// ============================================================================
+// run — the main dispatch loop
 // ============================================================================
 
 VMResult VM::run() {
+    CallFrame* frame = &frames_[frameCount_ - 1];
+
     for (;;) {
+        if (traceExecution_) {
+            printStack();
+            frame->chunk->disassembleInstruction(frame->ip);
+        }
+
         uint8_t instruction = readByte();
 
-        switch (instruction) {
+        switch (static_cast<OpCode>(instruction)) {
 
             // ---- CONSTANTS & LITERALS ----
-
-            case OP_CONSTANT: {
+            case OpCode::OP_CONSTANT: {
                 const Value& constant = readConstant();
                 push(constant);
                 break;
             }
 
-            case OP_TRUE: {
+            case OpCode::OP_TRUE:
                 push(Value(true));
                 break;
-            }
 
-            case OP_FALSE: {
+            case OpCode::OP_FALSE:
                 push(Value(false));
                 break;
-            }
 
             // ---- ARITHMETIC ----
-
-            case OP_ADD: {
+            case OpCode::OP_ADD: {
                 Value b = pop();
                 Value a = pop();
 
-                // String concatenation
                 if (a.type == ValueType::STRING && b.type == ValueType::STRING) {
                     push(Value(a.strVal + b.strVal));
-                }
-                // String + number → concatenation
-                else if (a.type == ValueType::STRING && b.type == ValueType::INTEGER) {
+                } else if (a.type == ValueType::STRING && b.type == ValueType::INTEGER) {
                     push(Value(a.strVal + std::to_string(b.intVal)));
-                }
-                else if (a.type == ValueType::INTEGER && b.type == ValueType::STRING) {
+                } else if (a.type == ValueType::INTEGER && b.type == ValueType::STRING) {
                     push(Value(std::to_string(a.intVal) + b.strVal));
-                }
-                // Numeric addition
-                else {
+                } else {
                     push(Value(a.intVal + b.intVal));
                 }
                 break;
             }
 
-            case OP_SUB: {
+            case OpCode::OP_SUB: {
                 Value b = pop();
                 Value a = pop();
                 push(Value(a.intVal - b.intVal));
                 break;
             }
 
-            case OP_MUL: {
+            case OpCode::OP_MUL: {
                 Value b = pop();
                 Value a = pop();
                 push(Value(a.intVal * b.intVal));
                 break;
             }
 
-            case OP_DIV: {
+            case OpCode::OP_DIV: {
                 Value b = pop();
                 Value a = pop();
                 if (b.intVal == 0) {
@@ -136,23 +151,35 @@ VMResult VM::run() {
                 break;
             }
 
-            case OP_NEGATE: {
+            case OpCode::OP_NEGATE: {
                 Value a = pop();
                 push(Value(-a.intVal));
                 break;
             }
 
             // ---- LOGICAL ----
-
-            case OP_NOT: {
+            case OpCode::OP_NOT: {
                 Value a = pop();
                 push(Value(!isTruthy(a)));
                 break;
             }
 
-            // ---- COMPARISON ----
+            case OpCode::OP_AND: {
+                Value b = pop();
+                Value a = pop();
+                push(Value(isTruthy(a) && isTruthy(b)));
+                break;
+            }
 
-            case OP_EQUAL: {
+            case OpCode::OP_OR: {
+                Value b = pop();
+                Value a = pop();
+                push(Value(isTruthy(a) || isTruthy(b)));
+                break;
+            }
+
+            // ---- COMPARISON ----
+            case OpCode::OP_EQUAL: {
                 Value b = pop();
                 Value a = pop();
                 if (a.type == ValueType::INTEGER && b.type == ValueType::INTEGER)
@@ -162,11 +189,11 @@ VMResult VM::run() {
                 else if (a.type == ValueType::STRING && b.type == ValueType::STRING)
                     push(Value(a.strVal == b.strVal));
                 else
-                    push(Value(false));  // different types are not equal
+                    push(Value(false));
                 break;
             }
 
-            case OP_NOT_EQUAL: {
+            case OpCode::OP_NOT_EQUAL: {
                 Value b = pop();
                 Value a = pop();
                 if (a.type == ValueType::INTEGER && b.type == ValueType::INTEGER)
@@ -176,61 +203,109 @@ VMResult VM::run() {
                 else if (a.type == ValueType::STRING && b.type == ValueType::STRING)
                     push(Value(a.strVal != b.strVal));
                 else
-                    push(Value(true));  // different types are not equal
+                    push(Value(true));
                 break;
             }
 
-            case OP_LESS: {
+            case OpCode::OP_LESS: {
                 Value b = pop();
                 Value a = pop();
                 push(Value(a.intVal < b.intVal));
                 break;
             }
 
-            case OP_LESS_EQUAL: {
+            case OpCode::OP_LESS_EQUAL: {
                 Value b = pop();
                 Value a = pop();
                 push(Value(a.intVal <= b.intVal));
                 break;
             }
 
-            case OP_GREATER: {
+            case OpCode::OP_GREATER: {
                 Value b = pop();
                 Value a = pop();
                 push(Value(a.intVal > b.intVal));
                 break;
             }
 
-            case OP_GREATER_EQUAL: {
+            case OpCode::OP_GREATER_EQUAL: {
                 Value b = pop();
                 Value a = pop();
                 push(Value(a.intVal >= b.intVal));
                 break;
             }
 
-            // ---- VARIABLES ----
-
-            case OP_SET_GLOBAL: {
+            // ---- GLOBAL VARIABLES ----
+            case OpCode::OP_SET_GLOBAL: {
                 uint8_t slot = readByte();
-                globals_[slot] = pop();
+                globals_[slot] = peek(0);
                 break;
             }
 
-            case OP_GET_GLOBAL: {
+            case OpCode::OP_GET_GLOBAL: {
                 uint8_t slot = readByte();
                 push(globals_[slot]);
                 break;
             }
 
-            // ---- I/O ----
+            // ---- LOCAL VARIABLES ----
+            case OpCode::OP_SET_LOCAL: {
+                uint8_t slot = readByte();
+                stack_[frame->basePointer + 1 + slot] = peek(0);
+                break;
+            }
 
-            case OP_PRINT: {
+            case OpCode::OP_GET_LOCAL: {
+                uint8_t slot = readByte();
+                push(stack_[frame->basePointer + 1 + slot]);
+                break;
+            }
+
+            // ---- FUNCTIONS ----
+            case OpCode::OP_CALL: {
+                int argCount = readByte();
+                Value callee = peek(argCount);
+
+                if (callee.type != ValueType::FUNCTION || callee.funcVal == nullptr) {
+                    runtimeError("Can only call functions.");
+                    return VMResult::RUNTIME_ERROR;
+                }
+
+                if (!callFunction(callee.funcVal, argCount)) {
+                    return VMResult::RUNTIME_ERROR;
+                }
+
+                frame = &frames_[frameCount_ - 1]; // update current frame
+                break;
+            }
+
+            case OpCode::OP_RETURN: {
+                Value result = pop(); // grab return value
+                int oldBase = frame->basePointer;
+
+                frameCount_--;
+                if (frameCount_ == 0) {
+                    // Top-level script finished
+                    pop(); // pop the script function object
+                    return VMResult::OK;
+                }
+
+                // Discard call frame and its locals/args
+                sp_ = oldBase;
+                push(result); // push result onto caller's stack
+
+                frame = &frames_[frameCount_ - 1]; // restore caller frame
+                break;
+            }
+
+            // ---- I/O ----
+            case OpCode::OP_PRINT: {
                 Value value = pop();
                 std::cout << valueToString(value) << std::endl;
                 break;
             }
 
-            case OP_INPUT: {
+            case OpCode::OP_INPUT: {
                 std::cout << "? ";
                 int input;
                 std::cin >> input;
@@ -239,32 +314,29 @@ VMResult VM::run() {
             }
 
             // ---- CONTROL FLOW ----
-
-            case OP_JUMP: {
+            case OpCode::OP_JUMP: {
                 uint16_t target = readShort();
-                ip_ = target;
+                frame->ip = target;
                 break;
             }
 
-            case OP_JUMP_IF_FALSE: {
+            case OpCode::OP_JUMP_IF_FALSE: {
                 uint16_t target = readShort();
                 Value condition = pop();
                 if (!isTruthy(condition)) {
-                    ip_ = target;
+                    frame->ip = target;
                 }
                 break;
             }
 
             // ---- STACK ----
-
-            case OP_POP: {
+            case OpCode::OP_POP: {
                 pop();
                 break;
             }
 
             // ---- HALT ----
-
-            case OP_HALT: {
+            case OpCode::OP_HALT: {
                 return VMResult::OK;
             }
 
@@ -281,7 +353,7 @@ VMResult VM::run() {
 // ============================================================================
 
 void VM::push(const Value& value) {
-    if (sp_ >= 256) {
+    if (sp_ >= STACK_MAX) {
         runtimeError("Stack overflow.");
         return;
     }
@@ -296,8 +368,8 @@ Value VM::pop() {
     return stack_[--sp_];
 }
 
-const Value& VM::peek() const {
-    return stack_[sp_ - 1];
+const Value& VM::peek(int distance) const {
+    return stack_[sp_ - 1 - distance];
 }
 
 // ============================================================================
@@ -305,12 +377,12 @@ const Value& VM::peek() const {
 // ============================================================================
 
 uint8_t VM::readByte() {
-    return chunk_->code[ip_++];
+    return frames_[frameCount_ - 1].chunk->code[frames_[frameCount_ - 1].ip++];
 }
 
 const Value& VM::readConstant() {
     uint8_t index = readByte();
-    return chunk_->constants[index];
+    return frames_[frameCount_ - 1].chunk->constants[index];
 }
 
 uint16_t VM::readShort() {
@@ -325,8 +397,9 @@ uint16_t VM::readShort() {
 
 void VM::runtimeError(const std::string& message) {
     hadError_ = true;
-    int line = chunk_->lines[ip_ > 0 ? ip_ - 1 : 0];
-    std::cerr << "[Runtime Error] Line " << line << ": " << message << std::endl;
+    CallFrame* frame = &frames_[frameCount_ - 1];
+    int line = frame->chunk->lines[frame->ip > 0 ? frame->ip - 1 : 0];
+    std::cerr << "[Runtime Error] Line " << line << " in " << frame->chunk << ": " << message << std::endl;
 }
 
 } // namespace cvm

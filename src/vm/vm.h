@@ -1,43 +1,22 @@
 // ============================================================================
-// CVM++ : vm.h — Virtual Machine Declaration
+// CVM++ : vm/vm.h — Virtual Machine Declaration
 // ============================================================================
+// Stack-based VM with call frame support for function calls.
 //
-// The VM is the final stage of the pipeline — the execution engine.
-// It takes a compiled Chunk (bytecode + constant pool) and RUNS it.
+// CALL FRAME ARCHITECTURE:
+//   Each function call creates a CallFrame that tracks:
+//   - Which chunk is being executed (the function's bytecode)
+//   - The instruction pointer within that chunk
+//   - The base pointer (where this frame's stack window starts)
 //
-//   Source → [Lexer] → Tokens → [Parser] → AST → [Compiler] → Chunk → [VM] → Output
-//                                                                        ↑ YOU ARE HERE
-//
-// ARCHITECTURE: Stack-Based VM
-// ----------------------------
-// The CVM++ VM is a **stack-based** virtual machine.  This means:
-//   - Values are pushed onto and popped from an operand stack
-//   - Operators pop their arguments and push their results
-//   - There are NO registers (unlike x86, ARM, or LLVM IR)
-//
-// This is the same architecture used by:
-//   - Java Virtual Machine (JVM)
-//   - Python's CPython interpreter
-//   - .NET's Common Language Runtime (CLR)
-//   - Lua's VM
-//
-// WHY STACK-BASED?
-// ----------------
-// Stack-based VMs are simpler to implement than register-based VMs.
-// The compiler doesn't need to do register allocation — it just pushes
-// and pops.  The tradeoff is slightly more instructions (each operation
-// needs explicit push/pop), but for a learning project this is ideal.
-//
-// THE DISPATCH LOOP
-// -----------------
-// The VM's core is a tight loop:
-//   1. FETCH:   read the next bytecode instruction
-//   2. DECODE:  switch on the opcode
-//   3. EXECUTE: perform the operation (push, pop, arithmetic, jump, etc.)
-//   4. REPEAT
-//
-// This is called the "fetch-decode-execute" cycle — the same fundamental
-// pattern used by real CPUs!
+//   Stack layout during a call to f(a, b):
+//   ┌──────────────────┐
+//   │ ...caller data...│
+//   │ <fn f>           │ ← basePointer (slot 0 from f's perspective)
+//   │ arg a            │ ← local 0
+//   │ arg b            │ ← local 1
+//   │ ...f's locals... │
+//   └──────────────────┘
 // ============================================================================
 
 #ifndef CVM_VM_H
@@ -47,71 +26,82 @@
 #include <vector>
 #include <string>
 
-#include "../compiler/chunk.h"
+#include "../common/value.h"
 
 namespace cvm {
 
 // ============================================================================
-// VMResult — outcome of VM execution
+// CallFrame — one frame on the call stack
 // ============================================================================
 
-enum class VMResult {
-    OK,             // program completed successfully
-    RUNTIME_ERROR,  // a runtime error occurred
-    COMPILE_ERROR   // shouldn't happen if compiler checked, but just in case
+struct CallFrame {
+    const Chunk*  chunk;       // bytecode being executed
+    size_t        ip;          // instruction pointer
+    int           basePointer; // base of this frame's stack window
 };
 
 // ============================================================================
-// VM — the stack-based virtual machine
+// VMResult
+// ============================================================================
+
+enum class VMResult {
+    OK,
+    RUNTIME_ERROR,
+    COMPILE_ERROR
+};
+
+// ============================================================================
+// VM
 // ============================================================================
 
 class VM {
 public:
     VM();
 
-    // interpret — run a compiled chunk
     VMResult interpret(const Chunk& chunk);
 
-private:
-    // ======================== EXECUTION ====================================
+    // Access globals for REPL persistence
+    std::vector<Value>& getGlobals() { return globals_; }
+    const std::vector<Value>& getGlobals() const { return globals_; }
 
-    // run — the main dispatch loop
+    // Trace mode: print each instruction and stack state
+    void setTraceExecution(bool enabled) { traceExecution_ = enabled; }
+
+private:
     VMResult run();
 
-    // ======================== STACK OPERATIONS ==============================
-
-    // push — push a value onto the operand stack
+    // Stack operations
     void push(const Value& value);
-
-    // pop — pop and return the top value from the stack
     Value pop();
+    const Value& peek(int distance = 0) const;
 
-    // peek — look at the top value without popping
-    const Value& peek() const;
-
-    // ======================== BYTECODE READING ==============================
-
-    // readByte — read and return the next byte, advancing the IP
+    // Bytecode reading (from current frame)
     uint8_t readByte();
-
-    // readConstant — read a constant index and return the constant
     const Value& readConstant();
-
-    // readShort — read a 2-byte offset (for jumps)
     uint16_t readShort();
 
-    // ======================== ERROR HANDLING ================================
+    // Call a function
+    bool callFunction(std::shared_ptr<FunctionObj> func, int argCount);
 
+    // Error reporting
     void runtimeError(const std::string& message);
 
-    // ============================ DATA =====================================
+    // Trace helper
+    void printStack() const;
 
-    const Chunk*                  chunk_;     // the chunk being executed
-    size_t                        ip_;        // instruction pointer (index into code)
-    std::array<Value, 256>        stack_;     // the operand stack (fixed size)
-    int                           sp_;        // stack pointer (next free slot)
-    std::vector<Value>            globals_;   // global variable storage
-    bool                          hadError_;
+    // ============================ DATA =====================================
+    static const int STACK_MAX = 1024;
+    static const int FRAMES_MAX = 64;
+
+    std::array<Value, STACK_MAX>      stack_;
+    int                               sp_;
+
+    std::array<CallFrame, FRAMES_MAX> frames_;
+    int                               frameCount_;
+
+    std::vector<Value>                globals_;
+    bool                              hadError_;
+    bool                              traceExecution_;
 };
 
 } // namespace cvm

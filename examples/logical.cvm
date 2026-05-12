@@ -1,0 +1,14 @@
+// ============================================
+// CVM++ Example: Logical operators
+// ============================================
+
+let a = true
+let b = false
+
+print "true and false: " + (a and b)
+print "true or false: " + (a or b)
+print "not true: " + (!a)
+
+if a and !b {
+    print "Logical conditions work!"
+}

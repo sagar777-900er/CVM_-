@@ -1,6 +1,7 @@
 // ============================================================================
-// CVM++ : lexer.cpp — Lexer implementation
+// CVM++ : lexer/lexer.cpp — Lexer Implementation
 // ============================================================================
+
 #include "lexer.h"
 #include <iostream>
 
@@ -22,11 +23,9 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords_ = {
     { "return", TokenType::RETURN        },
 };
 
-// Constructor — move the source string in, initialize cursor at position 0
 Lexer::Lexer(std::string source)
     : source_(std::move(source)), start_(0), current_(0), line_(1) {}
 
-// tokenize — main entry point. Scans all tokens and returns them.
 std::vector<Token> Lexer::tokenize() {
     while (!isAtEnd()) {
         start_ = current_;
@@ -36,7 +35,6 @@ std::vector<Token> Lexer::tokenize() {
     return std::move(tokens_);
 }
 
-// scanToken — identify and emit one token
 void Lexer::scanToken() {
     char c = advance();
 
@@ -46,8 +44,8 @@ void Lexer::scanToken() {
         case '-': addToken(TokenType::MINUS);   break;
         case '*': addToken(TokenType::STAR);    break;
         case '/':
-            // Handle single-line comments: // ...
             if (match('/')) {
+                // Single-line comment — consume until end of line
                 while (!isAtEnd() && peek() != '\n') advance();
             } else {
                 addToken(TokenType::SLASH);
@@ -57,6 +55,8 @@ void Lexer::scanToken() {
         case ')': addToken(TokenType::RPAREN);  break;
         case '{': addToken(TokenType::LBRACE);  break;
         case '}': addToken(TokenType::RBRACE);  break;
+        case ';': addToken(TokenType::SEMICOLON); break;
+        case ',': addToken(TokenType::COMMA);     break;
 
         // Two-character tokens
         case '=':
@@ -65,7 +65,6 @@ void Lexer::scanToken() {
         case '!':
             addToken(match('=') ? TokenType::BANG_EQUAL : TokenType::BANG);
             break;
-
         case '<':
             addToken(match('=') ? TokenType::LESS_EQUAL : TokenType::LESS);
             break;
@@ -73,15 +72,16 @@ void Lexer::scanToken() {
             addToken(match('=') ? TokenType::GREATER_EQUAL : TokenType::GREATER);
             break;
 
-        // Delimiters
-        case ';': addToken(TokenType::SEMICOLON); break;
-        case ',': addToken(TokenType::COMMA);     break;
+        // String literals — now a proper case instead of hiding in default
+        case '"':
+            scanString();
+            break;
 
         // Whitespace
         case ' ': case '\t': case '\r':
-            break; // skip
+            break;
 
-        // Newlines — emitted as tokens (statement separators)
+        // Newlines
         case '\n':
             addToken(TokenType::NEWLINE);
             line_++;
@@ -92,24 +92,20 @@ void Lexer::scanToken() {
                 scanNumber();
             } else if (isAlpha(c)) {
                 scanIdentifierOrKeyword();
-            } else if (c == '"') {
-                scanString();
             } else {
-                std::cerr << "[Lexer Error] Unexpected character '"
-                          << c << "' on line " << line_ << std::endl;
+                std::cerr << "[line " << line_ << "] Lexer Error: Unexpected character '"
+                          << c << "'" << std::endl;
                 addToken(TokenType::UNKNOWN);
             }
             break;
     }
 }
 
-// scanNumber — consume consecutive digits, emit NUMBER
 void Lexer::scanNumber() {
     while (!isAtEnd() && isDigit(peek())) advance();
     addToken(TokenType::NUMBER);
 }
 
-// scanIdentifierOrKeyword — consume identifier, check keyword table
 void Lexer::scanIdentifierOrKeyword() {
     while (!isAtEnd() && isAlphaNumeric(peek())) advance();
     std::string text = source_.substr(start_, current_ - start_);
@@ -117,24 +113,21 @@ void Lexer::scanIdentifierOrKeyword() {
     addToken(it != keywords_.end() ? it->second : TokenType::IDENTIFIER);
 }
 
-// scanString — consume characters between double quotes, emit STRING
 void Lexer::scanString() {
-    // start_ currently points to the opening '"' character.
-    // We consume everything until the closing '"'.
     while (!isAtEnd() && peek() != '"') {
-        if (peek() == '\n') line_++;  // strings can span multiple lines
+        if (peek() == '\n') line_++;
         advance();
     }
 
     if (isAtEnd()) {
-        std::cerr << "[Lexer Error] Unterminated string on line " << line_ << std::endl;
+        std::cerr << "[line " << line_ << "] Lexer Error: Unterminated string." << std::endl;
         addToken(TokenType::UNKNOWN);
         return;
     }
 
-    advance(); // consume the closing '"'
+    advance(); // consume closing '"'
 
-    // Extract the string contents (without the surrounding quotes)
+    // Extract contents without quotes
     std::string value = source_.substr(start_ + 1, current_ - start_ - 2);
     tokens_.emplace_back(TokenType::STRING, std::move(value), line_);
 }
@@ -151,12 +144,10 @@ bool Lexer::match(char expected) {
     return true;
 }
 
-// ---- Character classification ----
 bool Lexer::isDigit(char c)         { return c >= '0' && c <= '9'; }
 bool Lexer::isAlpha(char c)         { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
 bool Lexer::isAlphaNumeric(char c)  { return isAlpha(c) || isDigit(c); }
 
-// addToken — extract lexeme from source and append token
 void Lexer::addToken(TokenType type) {
     std::string lexeme = source_.substr(start_, current_ - start_);
     tokens_.emplace_back(type, std::move(lexeme), line_);

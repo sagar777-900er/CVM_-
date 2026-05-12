@@ -1,18 +1,12 @@
 // ============================================================================
-// CVM++ : compiler.cpp — Bytecode Compiler Implementation
+// CVM++ : compiler/compiler.cpp — Bytecode Compiler Implementation
 // ============================================================================
-//
-// This file compiles an AST into bytecode by recursively visiting each node
-// and emitting the appropriate instructions.
-//
 // KEY PRINCIPLE: Every expression leaves exactly ONE value on the stack.
-// Every statement has a net-zero stack effect (it may push and pop internally,
-// but the stack depth is the same before and after).
+// Every statement has a net-zero stack effect.
 // ============================================================================
 
 #include "compiler.h"
 #include <iostream>
-#include <utility>
 
 namespace cvm {
 
@@ -21,23 +15,37 @@ namespace cvm {
 // ============================================================================
 
 Compiler::Compiler()
-    : currentLine_(1), hadError_(false), nextGlobalSlot_(0) {}
+    : current_(nullptr), currentLine_(1), hadError_(false), nextGlobalSlot_(0) {}
 
 // ============================================================================
 // compile — main entry point
 // ============================================================================
 
-Chunk Compiler::compile(const Program& program) {
-    chunk_ = Chunk();  // fresh chunk
-    globals_.clear();
-    nextGlobalSlot_ = 0;
+Chunk Compiler::compile(const Program& program, bool resetGlobals) {
+    // Reset state
+    topLevel_ = FunctionCompiler();
+    current_ = &topLevel_;
+    hadError_ = false;
+
+    if (resetGlobals) {
+        globals_.clear();
+        nextGlobalSlot_ = 0;
+    }
 
     for (const auto& stmt : program.statements) {
         compileStatement(stmt);
     }
 
-    emitByte(OP_HALT);
-    return std::move(chunk_);
+    emitByte(static_cast<uint8_t>(OpCode::OP_HALT));
+    return std::move(current_->function->chunk);
+}
+
+// ============================================================================
+// currentChunk — get the chunk we're currently compiling into
+// ============================================================================
+
+Chunk& Compiler::currentChunk() {
+    return current_->function->chunk;
 }
 
 // ============================================================================
@@ -47,99 +55,134 @@ Chunk Compiler::compile(const Program& program) {
 void Compiler::compileStatement(const Stmt& stmt) {
     switch (stmt.type) {
 
-        // ---- LET: let x = expr ----
-        // Compile the initializer (pushes value), then store it in a global slot.
+        // ---- LET ----
         case StmtType::LET: {
-            compileExpression(*stmt.expr);              // push initializer value
-            int slot = resolveGlobal(stmt.name);        // get/create slot for name
-            emitBytes(OP_SET_GLOBAL, static_cast<uint8_t>(slot));  // store it
-            break;
-        }
+            compileExpression(*stmt.expr);
 
-        // ---- PRINT: print expr ----
-        // Compile the expression (pushes value), then print and pop it.
-        case StmtType::PRINT: {
-            compileExpression(*stmt.expr);              // push value
-            emitByte(OP_PRINT);                         // print & pop
-            break;
-        }
-
-        // ---- EXPRESSION STATEMENT: expr ----
-        // Compile the expression, then discard the result (net-zero stack effect).
-        case StmtType::EXPRESSION: {
-            compileExpression(*stmt.expr);              // push value
-            emitByte(OP_POP);                           // discard
-            break;
-        }
-
-        // ---- BLOCK: { stmts... } ----
-        case StmtType::BLOCK: {
-            for (const auto& s : stmt.body) {
-                compileStatement(s);
+            if (current_->scopeDepth > 0) {
+                // Local variable: value is already on the stack at the right slot
+                addLocal(stmt.name);
+            } else {
+                // Global variable
+                int slot = resolveGlobal(stmt.name);
+                emitBytes(static_cast<uint8_t>(OpCode::OP_SET_GLOBAL),
+                          static_cast<uint8_t>(slot));
             }
             break;
         }
 
-        // ---- IF: if condition { then } else { else } ----
-        //
-        // Compiled bytecode layout:
-        //
-        //   [condition code]           ← pushes true/false
-        //   OP_JUMP_IF_FALSE  ──────┐  ← if false, jump to else/end
-        //   [then branch code]      │
-        //   OP_JUMP  ──────────────┐│  ← skip else branch
-        //   [else branch code]  ←──┘│  ← jumped to by JUMP_IF_FALSE
-        //   [continue...]      ←────┘  ← jumped to by JUMP
-        //
+        // ---- PRINT ----
+        case StmtType::PRINT: {
+            compileExpression(*stmt.expr);
+            emitByte(static_cast<uint8_t>(OpCode::OP_PRINT));
+            break;
+        }
+
+        // ---- EXPRESSION STATEMENT ----
+        case StmtType::EXPRESSION: {
+            compileExpression(*stmt.expr);
+            emitByte(static_cast<uint8_t>(OpCode::OP_POP));
+            break;
+        }
+
+        // ---- BLOCK ----
+        case StmtType::BLOCK: {
+            beginScope();
+            for (const auto& s : stmt.body) {
+                compileStatement(s);
+            }
+            endScope();
+            break;
+        }
+
+        // ---- IF ----
         case StmtType::IF: {
-            compileExpression(*stmt.expr);              // compile condition
+            compileExpression(*stmt.expr);
+            int jumpToElse = emitJump(OpCode::OP_JUMP_IF_FALSE);
 
-            int jumpToElse = emitJump(OP_JUMP_IF_FALSE);  // placeholder jump
-
-            // Compile "then" branch
             for (const auto& s : stmt.body) {
                 compileStatement(s);
             }
 
             if (!stmt.elseBody.empty()) {
-                int jumpOverElse = emitJump(OP_JUMP);   // skip else branch
-                patchJump(jumpToElse);                  // else starts here
-
+                int jumpOverElse = emitJump(OpCode::OP_JUMP);
+                patchJump(jumpToElse);
                 for (const auto& s : stmt.elseBody) {
                     compileStatement(s);
                 }
-
-                patchJump(jumpOverElse);                // continue after else
+                patchJump(jumpOverElse);
             } else {
-                patchJump(jumpToElse);                  // no else: jump to here
+                patchJump(jumpToElse);
             }
             break;
         }
 
-        // ---- WHILE: while condition { body } ----
-        //
-        // Compiled bytecode layout:
-        //
-        //   loopStart:
-        //   [condition code]           ← pushes true/false
-        //   OP_JUMP_IF_FALSE  ──────┐  ← if false, exit loop
-        //   [body code]             │
-        //   OP_JUMP (loop back)     │  ← unconditional jump to loopStart
-        //   [continue...]       ←───┘  ← exit point
-        //
+        // ---- WHILE ----
         case StmtType::WHILE: {
-            int loopStart = static_cast<int>(chunk_.size());  // remember start
+            int loopStart = static_cast<int>(currentChunk().size());
+            compileExpression(*stmt.expr);
+            int exitJump = emitJump(OpCode::OP_JUMP_IF_FALSE);
 
-            compileExpression(*stmt.expr);              // compile condition
-            int exitJump = emitJump(OP_JUMP_IF_FALSE);  // exit if false
-
-            // Compile body
             for (const auto& s : stmt.body) {
                 compileStatement(s);
             }
 
-            emitLoop(loopStart);                        // jump back to condition
-            patchJump(exitJump);                        // exit point is here
+            emitLoop(loopStart);
+            patchJump(exitJump);
+            break;
+        }
+
+        // ---- FUNCTION DECLARATION ----
+        // Compiles the function body into its own Chunk, then stores
+        // the FunctionObj as a constant in the enclosing chunk.
+        case StmtType::FUNCTION: {
+            // Save current compiler state
+            FunctionCompiler* enclosing = current_;
+
+            // Create new function compiler
+            FunctionCompiler funcCompiler;
+            funcCompiler.function->name = stmt.name;
+            funcCompiler.function->arity = static_cast<int>(stmt.params.size());
+            funcCompiler.scopeDepth = 1; // function body is scope depth 1
+
+            current_ = &funcCompiler;
+
+            // Add parameters as locals
+            for (const auto& param : stmt.params) {
+                addLocal(param);
+            }
+
+            // Compile function body
+            for (const auto& s : stmt.body) {
+                compileStatement(s);
+            }
+
+            // Implicit return (push 0 and return)
+            emitConstant(Value(0));
+            emitByte(static_cast<uint8_t>(OpCode::OP_RETURN));
+
+            // Get the completed function
+            std::shared_ptr<FunctionObj> func = funcCompiler.function;
+
+            // Restore previous compiler state
+            current_ = enclosing;
+
+            // Store function as a constant and assign to global
+            emitConstant(Value(func));
+            int slot = resolveGlobal(stmt.name);
+            emitBytes(static_cast<uint8_t>(OpCode::OP_SET_GLOBAL),
+                      static_cast<uint8_t>(slot));
+            break;
+        }
+
+        // ---- RETURN ----
+        case StmtType::RETURN: {
+            if (stmt.expr) {
+                compileExpression(*stmt.expr);
+            } else {
+                emitConstant(Value(0)); // return 0 if no expression
+            }
+            emitByte(static_cast<uint8_t>(OpCode::OP_RETURN));
             break;
         }
 
@@ -152,115 +195,117 @@ void Compiler::compileStatement(const Stmt& stmt) {
 // ============================================================================
 // EXPRESSION COMPILATION
 // ============================================================================
-// Every expression leaves exactly ONE value on the stack.
-// ============================================================================
 
 void Compiler::compileExpression(const Expr& expr) {
     switch (expr.type) {
 
-        // ---- NUMBER LITERAL: 42 ----
-        case ExprType::NUMBER_LITERAL: {
+        case ExprType::NUMBER_LITERAL:
             emitConstant(Value(expr.numberValue));
             break;
-        }
 
-        // ---- STRING LITERAL: "hello" ----
-        case ExprType::STRING_LITERAL: {
+        case ExprType::STRING_LITERAL:
             emitConstant(Value(expr.stringValue));
             break;
-        }
 
-        // ---- BOOL LITERAL: true / false ----
-        case ExprType::BOOL_LITERAL: {
-            emitByte(expr.boolValue ? OP_TRUE : OP_FALSE);
+        case ExprType::BOOL_LITERAL:
+            emitByte(static_cast<uint8_t>(
+                expr.boolValue ? OpCode::OP_TRUE : OpCode::OP_FALSE));
             break;
-        }
 
-        // ---- IDENTIFIER: x ----
-        // Look up the variable's global slot and push its value.
         case ExprType::IDENTIFIER: {
-            auto it = globals_.find(expr.name);
-            if (it == globals_.end()) {
-                // Variable not yet declared — might be used before declaration
-                // We'll assign a slot optimistically (the VM will catch uninitialized access)
-                int slot = resolveGlobal(expr.name);
-                emitBytes(OP_GET_GLOBAL, static_cast<uint8_t>(slot));
+            // First check locals, then globals
+            int localSlot = resolveLocal(expr.name);
+            if (localSlot != -1) {
+                emitBytes(static_cast<uint8_t>(OpCode::OP_GET_LOCAL),
+                          static_cast<uint8_t>(localSlot));
             } else {
-                emitBytes(OP_GET_GLOBAL, static_cast<uint8_t>(it->second));
+                int globalSlot = resolveGlobal(expr.name);
+                emitBytes(static_cast<uint8_t>(OpCode::OP_GET_GLOBAL),
+                          static_cast<uint8_t>(globalSlot));
             }
             break;
         }
 
-        // ---- UNARY: -x, !flag ----
         case ExprType::UNARY: {
-            compileExpression(*expr.operand);     // push operand
-
+            compileExpression(*expr.operand);
             if (expr.op == "-") {
-                emitByte(OP_NEGATE);
+                emitByte(static_cast<uint8_t>(OpCode::OP_NEGATE));
             } else if (expr.op == "!") {
-                emitByte(OP_NOT);
+                emitByte(static_cast<uint8_t>(OpCode::OP_NOT));
             } else {
                 error("Unknown unary operator: " + expr.op);
             }
             break;
         }
 
-        // ---- BINARY: a + b, x == y, etc. ----
         case ExprType::BINARY: {
-            // Compile both operands (each pushes one value)
-            compileExpression(*expr.left);       // push left
-            compileExpression(*expr.right);      // push right
+            compileExpression(*expr.left);
+            compileExpression(*expr.right);
 
-            // Emit the appropriate operator instruction
-            if      (expr.op == "+")  emitByte(OP_ADD);
-            else if (expr.op == "-")  emitByte(OP_SUB);
-            else if (expr.op == "*")  emitByte(OP_MUL);
-            else if (expr.op == "/")  emitByte(OP_DIV);
-            else if (expr.op == "==") emitByte(OP_EQUAL);
-            else if (expr.op == "!=") emitByte(OP_NOT_EQUAL);
-            else if (expr.op == "<")  emitByte(OP_LESS);
-            else if (expr.op == "<=") emitByte(OP_LESS_EQUAL);
-            else if (expr.op == ">")  emitByte(OP_GREATER);
-            else if (expr.op == ">=") emitByte(OP_GREATER_EQUAL);
-            // Logical AND: both must be truthy → implemented in the VM as
-            // "if both are truthy, push true; else push false"
-            // For simplicity, we use: (a != 0) * (b != 0) — but since our
-            // VM already handles truthiness, we add a dedicated AND/OR in
-            // the VM that checks truthiness of both operands.
-            // For now, we compile "and" as OP_MUL (truthy*truthy=truthy,
-            // anything*0=0) and "or" as OP_ADD + truthiness coercion.
-            // Actually the cleanest approach: treat and/or as operators that
-            // the VM handles by checking truthiness of both stack values.
-            else if (expr.op == "and") {
-                // Both values are on the stack. The VM's OP_MUL on integers
-                // works for booleans: 1*1=1, 1*0=0, 0*0=0.
-                // But we want proper boolean behavior, so let's use OP_EQUAL
-                // trickery. Actually, simplest: just multiply (truthy values).
-                emitByte(OP_MUL);
-            }
-            else if (expr.op == "or") {
-                // a OR b: if either is truthy. Using ADD: 1+0=1, 0+1=1, 1+1=2(truthy)
-                emitByte(OP_ADD);
-            }
+            if      (expr.op == "+")  emitByte(static_cast<uint8_t>(OpCode::OP_ADD));
+            else if (expr.op == "-")  emitByte(static_cast<uint8_t>(OpCode::OP_SUB));
+            else if (expr.op == "*")  emitByte(static_cast<uint8_t>(OpCode::OP_MUL));
+            else if (expr.op == "/")  emitByte(static_cast<uint8_t>(OpCode::OP_DIV));
+            else if (expr.op == "==") emitByte(static_cast<uint8_t>(OpCode::OP_EQUAL));
+            else if (expr.op == "!=") emitByte(static_cast<uint8_t>(OpCode::OP_NOT_EQUAL));
+            else if (expr.op == "<")  emitByte(static_cast<uint8_t>(OpCode::OP_LESS));
+            else if (expr.op == "<=") emitByte(static_cast<uint8_t>(OpCode::OP_LESS_EQUAL));
+            else if (expr.op == ">")  emitByte(static_cast<uint8_t>(OpCode::OP_GREATER));
+            else if (expr.op == ">=") emitByte(static_cast<uint8_t>(OpCode::OP_GREATER_EQUAL));
+            else if (expr.op == "and") emitByte(static_cast<uint8_t>(OpCode::OP_AND));
+            else if (expr.op == "or")  emitByte(static_cast<uint8_t>(OpCode::OP_OR));
             else {
                 error("Unknown binary operator: " + expr.op);
             }
             break;
         }
 
-        // ---- ASSIGN: x = expr ----
         case ExprType::ASSIGN: {
-            compileExpression(*expr.right);       // push the value
-            int slot = resolveGlobal(expr.name);
-            emitBytes(OP_SET_GLOBAL, static_cast<uint8_t>(slot));
-            // Assignment is an expression that also leaves the value on the stack
-            emitBytes(OP_GET_GLOBAL, static_cast<uint8_t>(slot));
+            compileExpression(*expr.right);
+
+            // Check locals first
+            int localSlot = resolveLocal(expr.name);
+            if (localSlot != -1) {
+                emitBytes(static_cast<uint8_t>(OpCode::OP_SET_LOCAL),
+                          static_cast<uint8_t>(localSlot));
+                // Assignment leaves value on stack
+                emitBytes(static_cast<uint8_t>(OpCode::OP_GET_LOCAL),
+                          static_cast<uint8_t>(localSlot));
+            } else {
+                int globalSlot = resolveGlobal(expr.name);
+                emitBytes(static_cast<uint8_t>(OpCode::OP_SET_GLOBAL),
+                          static_cast<uint8_t>(globalSlot));
+                emitBytes(static_cast<uint8_t>(OpCode::OP_GET_GLOBAL),
+                          static_cast<uint8_t>(globalSlot));
+            }
             break;
         }
 
-        // ---- INPUT ----
-        case ExprType::INPUT: {
-            emitByte(OP_INPUT);
+        case ExprType::INPUT:
+            emitByte(static_cast<uint8_t>(OpCode::OP_INPUT));
+            break;
+
+        // ---- FUNCTION CALL ----
+        case ExprType::CALL: {
+            // Push the function onto the stack
+            int localSlot = resolveLocal(expr.name);
+            if (localSlot != -1) {
+                emitBytes(static_cast<uint8_t>(OpCode::OP_GET_LOCAL),
+                          static_cast<uint8_t>(localSlot));
+            } else {
+                int globalSlot = resolveGlobal(expr.name);
+                emitBytes(static_cast<uint8_t>(OpCode::OP_GET_GLOBAL),
+                          static_cast<uint8_t>(globalSlot));
+            }
+
+            // Push arguments
+            for (const auto& arg : expr.arguments) {
+                compileExpression(*arg);
+            }
+
+            // Emit call with argument count
+            emitBytes(static_cast<uint8_t>(OpCode::OP_CALL),
+                      static_cast<uint8_t>(expr.arguments.size()));
             break;
         }
 
@@ -275,7 +320,7 @@ void Compiler::compileExpression(const Expr& expr) {
 // ============================================================================
 
 void Compiler::emitByte(uint8_t byte) {
-    chunk_.write(byte, currentLine_);
+    currentChunk().write(byte, currentLine_);
 }
 
 void Compiler::emitBytes(uint8_t byte1, uint8_t byte2) {
@@ -284,49 +329,76 @@ void Compiler::emitBytes(uint8_t byte1, uint8_t byte2) {
 }
 
 void Compiler::emitConstant(const Value& value) {
-    int index = chunk_.addConstant(value);
+    int index = currentChunk().addConstant(value);
     if (index > 255) {
         error("Too many constants in one chunk (max 256).");
         return;
     }
-    emitBytes(OP_CONSTANT, static_cast<uint8_t>(index));
+    emitBytes(static_cast<uint8_t>(OpCode::OP_CONSTANT),
+              static_cast<uint8_t>(index));
 }
 
-// emitJump — emit a jump instruction with a 2-byte placeholder offset.
-// Returns the position of the first offset byte so we can patch it later.
-int Compiler::emitJump(uint8_t jumpInstruction) {
-    emitByte(jumpInstruction);
-    emitByte(0xFF);  // placeholder hi byte
-    emitByte(0xFF);  // placeholder lo byte
-    return static_cast<int>(chunk_.size() - 2);  // position of hi byte
+int Compiler::emitJump(OpCode jumpInstruction) {
+    emitByte(static_cast<uint8_t>(jumpInstruction));
+    emitByte(0xFF);
+    emitByte(0xFF);
+    return static_cast<int>(currentChunk().size() - 2);
 }
 
-// patchJump — fill in a previously emitted jump to target the CURRENT position.
 void Compiler::patchJump(int offset) {
-    // Calculate how far to jump: from just after the jump instruction to here
-    int target = static_cast<int>(chunk_.size());
-
+    int target = static_cast<int>(currentChunk().size());
     if (target > 65535) {
         error("Jump target too far (max 65535 bytes).");
         return;
     }
-
-    chunk_.code[offset]     = static_cast<uint8_t>((target >> 8) & 0xFF);
-    chunk_.code[offset + 1] = static_cast<uint8_t>(target & 0xFF);
+    currentChunk().code[offset]     = static_cast<uint8_t>((target >> 8) & 0xFF);
+    currentChunk().code[offset + 1] = static_cast<uint8_t>(target & 0xFF);
 }
 
-// emitLoop — emit a jump backwards to the given start position.
 void Compiler::emitLoop(int loopStart) {
-    emitByte(OP_JUMP);
-    int target = loopStart;
-
-    if (target > 65535) {
+    emitByte(static_cast<uint8_t>(OpCode::OP_JUMP));
+    if (loopStart > 65535) {
         error("Loop target too far.");
         return;
     }
+    emitByte(static_cast<uint8_t>((loopStart >> 8) & 0xFF));
+    emitByte(static_cast<uint8_t>(loopStart & 0xFF));
+}
 
-    emitByte(static_cast<uint8_t>((target >> 8) & 0xFF));
-    emitByte(static_cast<uint8_t>(target & 0xFF));
+// ============================================================================
+// SCOPE MANAGEMENT
+// ============================================================================
+
+void Compiler::beginScope() {
+    current_->scopeDepth++;
+}
+
+void Compiler::endScope() {
+    current_->scopeDepth--;
+
+    // Pop all locals that belong to the scope we're leaving
+    while (!current_->locals.empty() &&
+           current_->locals.back().depth > current_->scopeDepth) {
+        emitByte(static_cast<uint8_t>(OpCode::OP_POP));
+        current_->locals.pop_back();
+    }
+}
+
+void Compiler::addLocal(const std::string& name) {
+    Local local;
+    local.name = name;
+    local.depth = current_->scopeDepth;
+    current_->locals.push_back(local);
+}
+
+int Compiler::resolveLocal(const std::string& name) {
+    // Walk locals backwards to find the innermost matching variable
+    for (int i = static_cast<int>(current_->locals.size()) - 1; i >= 0; i--) {
+        if (current_->locals[i].name == name) {
+            return i;
+        }
+    }
+    return -1; // not a local
 }
 
 // ============================================================================
@@ -338,14 +410,11 @@ int Compiler::resolveGlobal(const std::string& name) {
     if (it != globals_.end()) {
         return it->second;
     }
-
     int slot = nextGlobalSlot_++;
     globals_[name] = slot;
-
     if (slot > 255) {
         error("Too many global variables (max 256).");
     }
-
     return slot;
 }
 

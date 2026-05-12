@@ -1,26 +1,8 @@
 // ============================================================================
-// CVM++ : parser.cpp — Parser Implementation
+// CVM++ : parser/parser.cpp — Parser Implementation
 // ============================================================================
-//
-// This file implements the recursive descent parser.  Each parsing function
-// corresponds to a grammar rule and calls lower-level functions for
-// higher-precedence operations.
-//
-// CALL HIERARCHY (expression parsing):
-//
-//   parseExpression()               <- entry point (handles assignment)
-//     |-- parseOr()                 <- logical OR
-//         |-- parseAnd()            <- logical AND
-//             |-- parseEquality()       <- == !=
-//                 |-- parseComparison() <- < > <= >=
-//                     |-- parseAddition()    <- + -
-//                         |-- parseMultiplication()  <- * /
-//                             |-- parseUnary()   <- - !
-//                                 |-- parsePrimary()  <- numbers, idents, (expr)
-//
-// Each level handles operators of one precedence level, then delegates to
-// the next level for tighter-binding operators.  This naturally produces
-// a tree where higher-precedence operators are deeper (evaluated first).
+// Recursive descent parser. Each parsing function corresponds to a grammar
+// rule and calls lower-level functions for higher-precedence operations.
 // ============================================================================
 
 #include "parser.h"
@@ -28,10 +10,6 @@
 #include <utility>
 
 namespace cvm {
-
-// ============================================================================
-// Constructor
-// ============================================================================
 
 Parser::Parser(std::vector<Token> tokens)
     : tokens_(std::move(tokens)), current_(0), hadError_(false) {}
@@ -42,7 +20,6 @@ Parser::Parser(std::vector<Token> tokens)
 
 Program Parser::parse() {
     Program program;
-
     skipNewlines();
 
     while (!isAtEnd()) {
@@ -58,33 +35,47 @@ Program Parser::parse() {
 // ============================================================================
 
 Stmt Parser::parseStatement() {
-    if (match(TokenType::LET))   return parseLetStatement();
-    if (match(TokenType::PRINT)) return parsePrintStatement();
-    if (match(TokenType::IF))    return parseIfStatement();
-    if (match(TokenType::WHILE)) return parseWhileStatement();
+    if (match(TokenType::LET))    return parseLetStatement();
+    if (match(TokenType::PRINT))  return parsePrintStatement();
+    if (match(TokenType::IF))     return parseIfStatement();
+    if (match(TokenType::WHILE))  return parseWhileStatement();
+    if (match(TokenType::FN))     return parseFunctionStatement();
+    if (match(TokenType::RETURN)) return parseReturnStatement();
+
+    // Block statement: standalone { ... }
+    if (match(TokenType::LBRACE)) {
+        // We already consumed the '{', so parse the block body directly
+        skipNewlines();
+        std::vector<Stmt> statements;
+        while (!check(TokenType::RBRACE) && !isAtEnd()) {
+            statements.push_back(parseStatement());
+            skipNewlines();
+        }
+        consume(TokenType::RBRACE, "Expected '}' to end block.");
+        return makeBlockStmt(std::move(statements));
+    }
+
     return parseExpressionStatement();
 }
 
-// parseLetStatement — "let" IDENTIFIER "=" expression NEWLINE
+// let IDENTIFIER = expression NEWLINE
 Stmt Parser::parseLetStatement() {
     const Token& name = consume(TokenType::IDENTIFIER,
                                 "Expected variable name after 'let'.");
-    consume(TokenType::EQUAL, "Expected '=' after variable name in let statement.");
+    consume(TokenType::EQUAL, "Expected '=' after variable name.");
     ExprPtr initializer = parseExpression();
     expectNewline();
-
     return makeLetStmt(name.lexeme, std::move(initializer));
 }
 
-// parsePrintStatement — "print" expression NEWLINE
+// print expression NEWLINE
 Stmt Parser::parsePrintStatement() {
     ExprPtr expr = parseExpression();
     expectNewline();
-
     return makePrintStmt(std::move(expr));
 }
 
-// parseIfStatement — "if" expression block ("else" block)?
+// if expression block ("else" block)?
 Stmt Parser::parseIfStatement() {
     ExprPtr condition = parseExpression();
     skipNewlines();
@@ -102,31 +93,61 @@ Stmt Parser::parseIfStatement() {
                       std::move(elseBranch));
 }
 
-// parseWhileStatement — "while" expression block
+// while expression block
 Stmt Parser::parseWhileStatement() {
     ExprPtr condition = parseExpression();
     skipNewlines();
-
     std::vector<Stmt> body = parseBlock();
-
     return makeWhileStmt(std::move(condition), std::move(body));
 }
 
-// parseExpressionStatement — expression NEWLINE
+// fn IDENTIFIER "(" params? ")" block
+Stmt Parser::parseFunctionStatement() {
+    const Token& name = consume(TokenType::IDENTIFIER,
+                                "Expected function name after 'fn'.");
+    consume(TokenType::LPAREN, "Expected '(' after function name.");
+
+    std::vector<std::string> params;
+    if (!check(TokenType::RPAREN)) {
+        do {
+            const Token& param = consume(TokenType::IDENTIFIER,
+                                         "Expected parameter name.");
+            params.push_back(param.lexeme);
+        } while (match(TokenType::COMMA));
+    }
+    consume(TokenType::RPAREN, "Expected ')' after parameters.");
+
+    skipNewlines();
+    std::vector<Stmt> body = parseBlock();
+
+    return makeFunctionStmt(name.lexeme, std::move(params), std::move(body));
+}
+
+// return expression? NEWLINE
+Stmt Parser::parseReturnStatement() {
+    ExprPtr expr = nullptr;
+    // If there's an expression on the same line, parse it
+    if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) &&
+        !check(TokenType::RBRACE) && !isAtEnd()) {
+        expr = parseExpression();
+    }
+    expectNewline();
+    return makeReturnStmt(std::move(expr));
+}
+
+// expression NEWLINE
 Stmt Parser::parseExpressionStatement() {
     ExprPtr expr = parseExpression();
     expectNewline();
-
     return makeExpressionStmt(std::move(expr));
 }
 
-// parseBlock — "{" NEWLINE? statement* "}"
+// "{" NEWLINE? statement* "}"
 std::vector<Stmt> Parser::parseBlock() {
     consume(TokenType::LBRACE, "Expected '{' to begin block.");
     skipNewlines();
 
     std::vector<Stmt> statements;
-
     while (!check(TokenType::RBRACE) && !isAtEnd()) {
         statements.push_back(parseStatement());
         skipNewlines();
@@ -140,162 +161,148 @@ std::vector<Stmt> Parser::parseBlock() {
 // EXPRESSION PARSERS
 // ============================================================================
 
-// parseExpression — handles assignment (lowest precedence, right-associative)
+// Assignment (lowest precedence, right-associative)
 ExprPtr Parser::parseExpression() {
     ExprPtr expr = parseOr();
 
     if (match(TokenType::EQUAL)) {
-        ExprPtr value = parseExpression();  // right-associative: recurse
-
-        // The left side must be an identifier for assignment
+        ExprPtr value = parseExpression();
         if (expr->type == ExprType::IDENTIFIER) {
             return makeAssign(expr->name, std::move(value));
         }
-
         error("Invalid assignment target.");
     }
 
     return expr;
 }
 
-// parseOr — expr ("or" expr)*
 ExprPtr Parser::parseOr() {
     ExprPtr left = parseAnd();
-
     while (match(TokenType::OR)) {
         std::string op = previous().lexeme;
         ExprPtr right = parseAnd();
         left = makeBinary(op, std::move(left), std::move(right));
     }
-
     return left;
 }
 
-// parseAnd — expr ("and" expr)*
 ExprPtr Parser::parseAnd() {
     ExprPtr left = parseEquality();
-
     while (match(TokenType::AND)) {
         std::string op = previous().lexeme;
         ExprPtr right = parseEquality();
         left = makeBinary(op, std::move(left), std::move(right));
     }
-
     return left;
 }
 
-// parseEquality — expr ("==" | "!=") expr
 ExprPtr Parser::parseEquality() {
     ExprPtr left = parseComparison();
-
     while (match(TokenType::EQUAL_EQUAL, TokenType::BANG_EQUAL)) {
         std::string op = previous().lexeme;
         ExprPtr right = parseComparison();
         left = makeBinary(op, std::move(left), std::move(right));
     }
-
     return left;
 }
 
-// parseComparison — expr ("<" | ">" | "<=" | ">=") expr
 ExprPtr Parser::parseComparison() {
     ExprPtr left = parseAddition();
-
     while (match(TokenType::LESS, TokenType::GREATER,
                  TokenType::LESS_EQUAL, TokenType::GREATER_EQUAL)) {
         std::string op = previous().lexeme;
         ExprPtr right = parseAddition();
         left = makeBinary(op, std::move(left), std::move(right));
     }
-
     return left;
 }
 
-// parseAddition — expr ("+" | "-") expr
 ExprPtr Parser::parseAddition() {
     ExprPtr left = parseMultiplication();
-
     while (match(TokenType::PLUS, TokenType::MINUS)) {
         std::string op = previous().lexeme;
         ExprPtr right = parseMultiplication();
         left = makeBinary(op, std::move(left), std::move(right));
     }
-
     return left;
 }
 
-// parseMultiplication — expr ("*" | "/") expr
 ExprPtr Parser::parseMultiplication() {
     ExprPtr left = parseUnary();
-
     while (match(TokenType::STAR, TokenType::SLASH)) {
         std::string op = previous().lexeme;
         ExprPtr right = parseUnary();
         left = makeBinary(op, std::move(left), std::move(right));
     }
-
     return left;
 }
 
-// parseUnary — ("-" | "!") expr | primary
 ExprPtr Parser::parseUnary() {
     if (match(TokenType::MINUS, TokenType::BANG)) {
         std::string op = previous().lexeme;
-        ExprPtr operand = parseUnary();  // recursive: allows --x, !!flag
+        ExprPtr operand = parseUnary();
         return makeUnary(op, std::move(operand));
     }
-
-    return parsePrimary();
+    return parseCall();
 }
 
-// parsePrimary — literals, identifiers, parenthesized expressions
+// Function call: identifier "(" args? ")"
+ExprPtr Parser::parseCall() {
+    ExprPtr expr = parsePrimary();
+
+    // If the primary was an identifier followed by '(', it's a call
+    if (expr->type == ExprType::IDENTIFIER && match(TokenType::LPAREN)) {
+        std::string callee = expr->name;
+        std::vector<ExprPtr> args;
+
+        if (!check(TokenType::RPAREN)) {
+            do {
+                args.push_back(parseExpression());
+            } while (match(TokenType::COMMA));
+        }
+
+        consume(TokenType::RPAREN, "Expected ')' after arguments.");
+        return makeCall(callee, std::move(args));
+    }
+
+    return expr;
+}
+
 ExprPtr Parser::parsePrimary() {
     if (match(TokenType::NUMBER)) {
         return makeNumberLiteral(std::stoi(previous().lexeme));
     }
-
     if (match(TokenType::STRING)) {
         return makeStringLiteral(previous().lexeme);
     }
-
     if (match(TokenType::TRUE_LITERAL)) {
         return makeBoolLiteral(true);
     }
-
     if (match(TokenType::FALSE_LITERAL)) {
         return makeBoolLiteral(false);
     }
-
     if (match(TokenType::INPUT)) {
         return makeInput();
     }
-
     if (match(TokenType::IDENTIFIER)) {
         return makeIdentifier(previous().lexeme);
     }
-
     if (match(TokenType::LPAREN)) {
         ExprPtr expr = parseExpression();
         consume(TokenType::RPAREN, "Expected ')' after expression.");
         return expr;
     }
 
-    // Nothing matched — error
     error("Expected an expression.");
-    return makeNumberLiteral(0);  // dummy node for recovery
+    return makeNumberLiteral(0);
 }
 
 // ============================================================================
 // TOKEN HELPERS
 // ============================================================================
 
-const Token& Parser::peek() const {
-    return tokens_[current_];
-}
-
-const Token& Parser::previous() const {
-    return tokens_[current_ - 1];
-}
+const Token& Parser::peek() const     { return tokens_[current_]; }
+const Token& Parser::previous() const { return tokens_[current_ - 1]; }
 
 const Token& Parser::advance() {
     if (!isAtEnd()) current_++;
@@ -335,7 +342,7 @@ void Parser::error(const std::string& message) {
 
 void Parser::error(const Token& token, const std::string& message) {
     hadError_ = true;
-    std::cerr << "[Parse Error] Line " << token.line << ": " << message;
+    std::cerr << "[line " << token.line << "] Syntax Error: " << message;
     if (token.type == TokenType::EOF_TOKEN) {
         std::cerr << " (at end of file)";
     } else {
@@ -346,20 +353,19 @@ void Parser::error(const Token& token, const std::string& message) {
 
 void Parser::synchronize() {
     advance();
-
     while (!isAtEnd()) {
         if (previous().type == TokenType::NEWLINE) return;
-
         switch (peek().type) {
             case TokenType::LET:
             case TokenType::PRINT:
             case TokenType::IF:
             case TokenType::WHILE:
+            case TokenType::FN:
+            case TokenType::RETURN:
                 return;
             default:
                 break;
         }
-
         advance();
     }
 }
@@ -369,9 +375,7 @@ void Parser::synchronize() {
 // ============================================================================
 
 void Parser::skipNewlines() {
-    while (match(TokenType::NEWLINE) || match(TokenType::SEMICOLON)) {
-        // consume all newlines and semicolons
-    }
+    while (match(TokenType::NEWLINE) || match(TokenType::SEMICOLON)) {}
 }
 
 void Parser::expectNewline() {
@@ -380,7 +384,7 @@ void Parser::expectNewline() {
         return;
     }
     if (isAtEnd() || check(TokenType::RBRACE)) {
-        return;  // EOF or closing brace ends a statement implicitly
+        return;
     }
     error("Expected newline or ';' after statement.");
 }
